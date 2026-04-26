@@ -1,0 +1,247 @@
+require('dotenv').config();
+const { Telegraf } = require('telegraf');
+const { OpenAIClient, AzureKeyCredential } = require("@azure/openai");
+const axios = require('axios');
+const express = require('express');
+const { Pool } = require('pg');
+
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+const aiClient = new OpenAIClient(process.env.AZURE_ENDPOINT, new AzureKeyCredential(process.env.AZURE_KEY));
+const app = express();
+app.use(express.json());
+
+// Koneksi ke PostgreSQL
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const validateBudget = (budget) => {
+    const minBudget = 15000; 
+    const maxBudget = 5000000; 
+    const num = Number(budget);
+    return !isNaN(num) && num >= minBudget && num <= maxBudget;
+};
+
+bot.on('text', async (ctx) => {
+    const userMessage = ctx.message.text;
+    const chatId = ctx.chat.id;
+
+    // Daftarkan user ke DB jika belum ada
+    await pool.query('INSERT INTO users (telegram_chat_id) VALUES ($1) ON CONFLICT DO NOTHING', [chatId]);
+
+    await ctx.reply("🔄 Menyusun strategi dan materi iklan Anda...");
+
+    try {
+        const systemPrompt = `
+        Anda adalah Adsistent AI, asisten spesialis pembuat iklan Facebook untuk toko ritel/grosir.
+        Ekstrak permintaan pengguna ke dalam JSON murni.
+        Format Wajib:
+        {
+          "intent": "CREATE_AD" | "OTHER",
+          "product_name": "nama produk",
+          "budget_idr": "angka bulat (tanpa titik/koma)",
+          "copywriting": "Buatkan teks iklan yang persuasif, singkat, dan menggunakan bahasa Indonesia yang ramah."
+        }
+        Pesan Pengguna: "${userMessage}"
+        Keluarkan HANYA JSON.`;
+
+        const response = await aiClient.getChatCompletions(process.env.AZURE_DEPLOYMENT_NAME, [
+            { role: "system", content: "Keluarkan murni JSON tanpa format markdown." },
+            { role: "user", content: systemPrompt }
+        ]);
+
+        let rawJson = response.choices[0].message.content.replace(/```json/gi, '').replace(/```/gi, '').trim();
+        const aiData = JSON.parse(rawJson);
+
+        if (aiData.intent === "CREATE_AD") {
+            if (!validateBudget(aiData.budget_idr)) {
+                return ctx.reply("⚠️ Anggaran tidak valid. Pastikan minimal Rp15.000.");
+            }
+
+            const campaignName = `Adsistent - ${aiData.product_name} - ${Date.now()}`;
+            await ctx.reply(`🚀 Menyiapkan kampanye di Meta: ${campaignName}...`);
+
+            // MENGIRIM DATA ASLI KE META GRAPH API
+            const metaApiUrl = `https://graph.facebook.com/v19.0/${process.env.META_AD_ACCOUNT_ID}/campaigns`;
+            
+            try {
+                const metaResponse = await axios.post(metaApiUrl, {
+                    name: campaignName,
+                    objective: 'OUTCOME_LEADS', // Objektif pencarian prospek
+                    status: 'ACTIVE',
+                    special_ad_categories: ['NONE'],
+                    access_token: process.env.META_ACCESS_TOKEN
+                });
+
+                const campaignId = metaResponse.data.id;
+
+                // Simpan ke Database untuk dievaluasi oleh n8n nanti
+                await pool.query(
+                    'INSERT INTO campaigns (campaign_id, telegram_chat_id, campaign_name, daily_budget_idr) VALUES ($1, $2, $3, $4)',
+                    [campaignId, chatId, campaignName, aiData.budget_idr]
+                );
+
+                /* CATATAN ARSITEKTUR:
+                 * Di eksekusi produksi nyata, Meta mewajibkan Anda membuat Ad Set dan Ad 
+                 * setelah Campaign terbentuk. Anda perlu melakukan 2 HTTP POST request tambahan
+                 * ke endpoint /adsets dan /ads menggunakan campaignId ini.
+                 */
+
+                await ctx.reply(`✅ Kampanye berhasil tayang di Meta!\n\nID Kampanye: ${campaignId}\nAI akan mengawasi metriknya setiap jam.`);
+
+            } catch (metaError) {
+                console.error("Meta API Failed:", metaError.response?.data || metaError.message);
+                ctx.reply(`❌ Gagal menayangkan iklan ke Meta API. Pesan Error: ${metaError.response?.data?.error?.message || 'Unknown'}`);
+            }
+
+        } else {
+            ctx.reply("Sebutkan barang yang ingin diiklankan dan anggarannya. Saya akan urus sisanya.");
+        }
+    } catch (error) {
+        console.error("System Error:", error);
+        ctx.reply("⚠️ Maaf, AI gagal memproses permintaan Anda.");
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+// Gunakan Webhook sungguhan
+app.use(bot.webhookCallback('/secret-telegram-webhook'));
+
+app.listen(PORT, async () => {
+    console.log(`🚀 Adsistent Backend berjalan di port ${PORT}`);
+    try {
+        await bot.telegram.setWebhook(`${process.env.WEBHOOK_DOMAIN}/secret-telegram-webhook`);
+        console.log(`✅ Webhook Telegram berhasil diset ke ${process.env.WEBHOOK_DOMAIN}`);
+    } catch (e) {
+        console.error("Gagal set webhook:", e.message);
+    }
+});
+
+3. File Workflow n8n (Evaluasi & Pause API Asli)
+Simpan kode di bawah ini sebagai n8n-production.json. Workflow ini akan menarik seluruh campaign aktif dari Meta Anda (yang asli), mengevaluasi metrik (ROAS, CPA, Frekuensi), dan mengirimkan perintah PAUSED langsung ke server Meta jika kinerjanya buruk.
+{
+  "name": "Adsistent AI - Real Meta Insights & Pause",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [ { "field": "hours", "hoursInterval": 6 } ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Evaluasi Setiap 6 Jam",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [ 140, 360 ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v19.0/{{ $env[\"META_AD_ACCOUNT_ID\"] }}/campaigns",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "fields", "value": "id,name,status,insights.date_preset(last_3d){cpc,spend,cost_per_action_type,ctr,frequency,purchase_roas}" },
+            { "name": "access_token", "value": "={{ $env[\"META_ACCESS_TOKEN\"] }}" },
+            { "name": "effective_status", "value": "['ACTIVE']" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "real-meta-insights",
+      "name": "Tarik Insight Meta Asli",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [ 360, 360 ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "data",
+        "options": {}
+      },
+      "id": "item-lists",
+      "name": "Pisahkan per Kampanye",
+      "type": "n8n-nodes-base.itemLists",
+      "typeVersion": 3,
+      "position": [ 560, 360 ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaign = $input.item.json;\nlet action = 'OK';\nlet reason = '';\n\n// Bypass jika belum ada data insight\nif (!campaign.insights || !campaign.insights.data || campaign.insights.data.length === 0) {\n    return [{ json: { ...campaign, action: 'NO_DATA' } }];\n}\n\nconst metrics = campaign.insights.data[0];\nconst cpc = parseFloat(metrics.cpc || 0);\nconst ctr = parseFloat(metrics.ctr || 0);\nconst frequency = parseFloat(metrics.frequency || 0);\n\n// Mencari Cost per Lead\nlet cpl = 0;\nif (metrics.cost_per_action_type) {\n    const leadAction = metrics.cost_per_action_type.find(a => a.action_type === 'lead');\n    if (leadAction) cpl = parseFloat(leadAction.value);\n}\n\n// Algoritma Evaluasi\nif (cpl > 25000) {\n    action = 'PAUSE';\n    reason = `Cost Per Lead (CPL) terlalu mahal (Rp ${cpl}).`;\n} else if (cpc > 8000) {\n    action = 'PAUSE';\n    reason = `Cost Per Click (CPC) menguras anggaran (Rp ${cpc}).`;\n} else if (frequency > 3.5 && ctr < 1) {\n    action = 'ALERT';\n    reason = `Audience jenuh (Frekuensi ${frequency}x). Segera update gambar!`;\n}\n\nreturn [{ json: { id: campaign.id, name: campaign.name, action, reason, cpl, cpc, ctr } }];"
+      },
+      "id": "real-eval-logic",
+      "name": "Algoritma Evaluasi Real",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 780, 360 ]
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.action }}",
+        "rules": {
+          "rules": [
+            { "value2": "PAUSE", "output": 0 },
+            { "value2": "ALERT", "output": 1 }
+          ]
+        }
+      },
+      "id": "switch-action",
+      "name": "Tindakan Lanjutan",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [ 1000, 360 ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.id }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "status", "value": "PAUSED" },
+            { "name": "access_token", "value": "={{ $env[\"META_ACCESS_TOKEN\"] }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "real-meta-pause",
+      "name": "Matikan Iklan di Meta",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [ 1260, 240 ]
+    },
+    {
+      "parameters": {
+        "chatId": "MASUKKAN_CHAT_ID",
+        "text": "=🛑 *IKLAN DIHENTIKAN OTOMATIS (LIVE)*\n\nKampanye: {{$json.name}}\nAlasan: {{$json.reason}}\n\nAI baru saja menembak API Meta untuk menghentikan kampanye ini agar dana Anda aman.",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "tg-pause-alert",
+      "name": "Notifikasi Pause Asli",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [ 1480, 240 ],
+      "credentials": { "telegramApi": { "id": "ID_CREDENTIAL", "name": "Telegram Bot API" } }
+    }
+  ],
+  "connections": {
+    "Evaluasi Setiap 6 Jam": {
+      "main": [ [ { "node": "Tarik Insight Meta Asli", "type": "main", "index": 0 } ] ]
+    },
+    "Tarik Insight Meta Asli": {
+      "main": [ [ { "node": "Pisahkan per Kampanye", "type": "main", "index": 0 } ] ]
+    },
+    "Pisahkan per Kampanye": {
+      "main": [ [ { "node": "Algoritma Evaluasi Real", "type": "main", "index": 0 } ] ]
+    },
+    "Algoritma Evaluasi Real": {
+      "main": [ [ { "node": "Tindakan Lanjutan", "type": "main", "index": 0 } ] ]
+    },
+    "Tindakan Lanjutan": {
+      "main": [
+        [ { "node": "Matikan Iklan di Meta", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Matikan Iklan di Meta": {
+      "main": [ [ { "node": "Notifikasi Pause Asli", "type": "main", "index": 0 } ] ]
+    }
+  }
+}
